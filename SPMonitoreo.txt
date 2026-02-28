@@ -1,0 +1,107 @@
+CREATE PROCEDURE [dbo].[sp_ObtenerMonitoreoLotesMasivos]
+    @FechaDesde DATETIME = NULL,
+    @FechaHasta DATETIME = NULL,
+    @nlote_filtro NUMERIC = NULL,
+    @cmoneda_filtro CHAR(3) = NULL,
+    @cramo_filtro INT = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- 1. Obtenemos la data base
+    WITH DatosFiltrados AS (
+        SELECT 
+            P.nlote,
+            P.Id,
+            P.StatusBanco,
+            P.mcuotaML,
+            P.mcuotaEXT,
+            P.fultmod,
+            P.cusuariomod,
+            -- Mantenemos esto para saber quién fue el último en tocar el lote
+            ROW_NUMBER() OVER(PARTITION BY P.nlote ORDER BY P.fultmod DESC) as FilaUltimaMod
+        FROM TuTablaDePagos P
+        WHERE 
+            -- REGLA EXCLUYENTE: Búsqueda exacta por lote
+            (@nlote_filtro IS NOT NULL AND P.nlote = @nlote_filtro)
+            
+            OR 
+            
+            -- REGLA MASIVA: Búsqueda general con filtros
+            (@nlote_filtro IS NULL 
+                -- CAMBIO AQUÍ: Ahora comparamos exclusivamente contra la fecha de creación (fingreso)
+                AND (@FechaDesde IS NULL OR P.fingreso >= @FechaDesde)
+                AND (@FechaHasta IS NULL OR P.fingreso <= @FechaHasta)
+                
+                AND (@cmoneda_filtro IS NULL OR P.cmoneda = @cmoneda_filtro)
+                
+                -- Búsqueda dinámica del ramo en adpoliza mediante EXISTS
+                AND (@cramo_filtro IS NULL OR EXISTS (
+                    SELECT 1 
+                    FROM adpoliza AD 
+                    WHERE AD.cpoliza = P.cpoliza 
+                      AND AD.fanopol = P.fanopol 
+                      AND AD.fmespol = P.fmespol 
+                      AND AD.cramo = @cramo_filtro
+                ))
+            )
+    ),
+    
+    -- 2. Agrupaciones y matemáticas
+    AgregadosLote AS (
+        SELECT 
+            nlote,
+            COUNT(Id) AS TotalEnLote,
+            SUM(CASE WHEN StatusBanco > 0 THEN 1 ELSE 0 END) AS TotalSeleccionados,
+            SUM(CASE WHEN StatusBanco = 5 THEN 1 ELSE 0 END) AS Pagados,
+            SUM(CASE WHEN StatusBanco = 99 THEN 1 ELSE 0 END) AS ConError,
+            SUM(CASE WHEN StatusBanco = 5 THEN mcuotaML ELSE 0 END) AS MontoCobradoLocal,
+            SUM(CASE WHEN StatusBanco = 5 THEN mcuotaEXT ELSE 0 END) AS MontoCobradoExt,
+            SUM(CASE WHEN StatusBanco = 99 THEN mcuotaML ELSE 0 END) AS MontoErrorLocal,
+            SUM(CASE WHEN StatusBanco = 99 THEN mcuotaEXT ELSE 0 END) AS MontoErrorExt,
+            
+            -- Seguimos sacando el MAX de la modificación para mostrarlo en el Grid
+            MAX(fultmod) AS FechaUltimaModificacion,
+            MAX(CASE WHEN FilaUltimaMod = 1 THEN cusuariomod END) AS CodigoUsuarioModifico
+        FROM DatosFiltrados
+        GROUP BY nlote
+    )
+    
+    -- 3. Proyección final cruzando con maentes para el nombre del usuario
+    SELECT 
+        A.nlote AS [Nº Lote],
+        A.FechaUltimaModificacion AS [Última Modificación],
+        
+        ISNULL(M.xcliente, CAST(A.CodigoUsuarioModifico AS VARCHAR(100))) AS [Usuario Modificó],
+        
+        CASE 
+            WHEN A.TotalSeleccionados = 0 THEN '0: Estado Inicial'
+            WHEN A.TotalSeleccionados > 0 AND (A.Pagados + A.ConError) = A.TotalSeleccionados AND A.ConError > 0 THEN 'Finalizado (Con Errores)'
+            WHEN A.TotalSeleccionados > 0 AND (A.Pagados + A.ConError) = A.TotalSeleccionados AND A.ConError = 0 THEN '5: Finalizado (OK)'
+            WHEN A.TotalSeleccionados > 0 AND A.Pagados = 0 AND A.ConError = 0 THEN '1: Pendiente de Ejecución'
+            ELSE 'Procesando...'
+        END AS [Estado Lote],
+        
+        A.TotalEnLote AS [Total en Lote],
+        A.TotalSeleccionados AS [Seleccionados],
+        A.Pagados AS [Pagados (OK)],
+        A.ConError AS [Con Error],
+        (A.TotalSeleccionados - A.Pagados - A.ConError) AS [Pendientes],
+        
+        A.MontoCobradoLocal,
+        A.MontoCobradoExt,
+        A.MontoErrorLocal,
+        A.MontoErrorExt,
+        
+        CASE 
+            WHEN A.TotalSeleccionados = 0 THEN 0.0 
+            ELSE CAST(((A.Pagados + A.ConError) * 100.0) / A.TotalSeleccionados AS DECIMAL(5,2))
+        END AS [Progreso (%)]
+        
+    FROM AgregadosLote A
+    LEFT JOIN maentes M ON A.CodigoUsuarioModifico = M.cci_rif
+    
+    OPTION (RECOMPILE); 
+
+END
+GO
